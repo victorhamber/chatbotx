@@ -1,0 +1,199 @@
+x-network: &network
+  networks:
+    - main
+
+x-app-environment: &app-environment
+  BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+  BETTER_AUTH_URL: ${PUBLIC_URL}
+  DATABASE_URL: postgresql://chatbotx:${POSTGRES_PASSWORD}@postgres:5432/chatbotx
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  FORCE_PUBLIC_HTTPS: "true"
+  JAVASCRIPT_EXECUTOR_TOKEN: ${JAVASCRIPT_EXECUTOR_TOKEN}
+  JAVASCRIPT_EXECUTOR_URL: http://javascript-executor:3210
+  NEXT_PUBLIC_BUILDER_URL: ${PUBLIC_URL}
+  NEXT_PUBLIC_EDITION: community
+  NEXT_PUBLIC_INTERNAL_STORAGE_URL: http://filesystem:9000/chatbotx/
+  NODE_OPTIONS: --max_old_space_size=4096
+  REALTIME_BROADCAST_SECRET: ${REALTIME_BROADCAST_SECRET}
+  REALTIME_PROXY_URL: http://realtime:1999
+  REDIS_URL: redis://redis:6379
+  RUN_DB_MIGRATE: "true"
+  RUN_DB_SEED: "true"
+  S3_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY}
+  S3_BUCKET: chatbotx
+  S3_ENDPOINT: http://filesystem:9000
+  S3_REGION: us-west-2
+  S3_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY}
+  SCHEDULER_BUCKET_RANGE: 0-255
+  SMTP_FROM: no-reply@localhost
+  SMTP_SERVER: smtp://username:password@mailhog:1025
+
+x-rustfs-environment: &rustfs-environment
+  RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+  RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+  RUSTFS_API_CORS_ALLOW_ORIGIN: "*"
+
+services:
+  postgres:
+    <<: *network
+    image: timescale/timescaledb-ha:pg18.4-ts2.27.2-all
+    volumes:
+      - db-data:/home/postgres/pgdata
+    environment:
+      POSTGRES_DB: chatbotx
+      POSTGRES_USER: chatbotx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d chatbotx -U chatbotx"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  mailhog:
+    <<: *network
+    image: mailhog/mailhog:v1.0.1
+
+  filesystem:
+    <<: *network
+    image: rustfs/rustfs:1.0.0-beta.8
+    command: server /data --console-address ":9001"
+    environment:
+      <<: *rustfs-environment
+    volumes:
+      - filesystem-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  filesystem-init:
+    <<: *network
+    image: rustfs/rc:v0.1.22
+    depends_on:
+      filesystem:
+        condition: service_healthy
+    environment:
+      <<: *rustfs-environment
+    entrypoint: >
+      /bin/sh -c "rc alias set local http://filesystem:9000
+      $${RUSTFS_ACCESS_KEY} $${RUSTFS_SECRET_KEY}; rc mb local/chatbotx
+      --ignore-existing; touch /tmp/empty && rc cp /tmp/empty
+      local/chatbotx/public/; rc anonymous set public local/chatbotx/public;"
+    restart: "no"
+
+  redis:
+    <<: *network
+    image: redis:8.8.0-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  javascript-executor:
+    image: ghcr.io/chatbotxio/chatbotx-javascript-executor:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    networks:
+      - javascript-executor-network
+    environment:
+      JAVASCRIPT_EXECUTOR_TOKEN: ${JAVASCRIPT_EXECUTOR_TOKEN}
+      MAX_CONCURRENCY: "2"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3210/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  builder:
+    <<: *network
+    image: ghcr.io/chatbotxio/chatbotx-builder:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      filesystem:
+        condition: service_healthy
+      filesystem-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  worker:
+    <<: *network
+    image: ghcr.io/chatbotxio/chatbotx-worker:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+    networks:
+      - main
+      - javascript-executor-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      filesystem:
+        condition: service_healthy
+      javascript-executor:
+        condition: service_healthy
+
+  realtime:
+    <<: *network
+    image: ghcr.io/chatbotxio/chatbotx-realtime:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+
+  proxy:
+    <<: *network
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - builder
+      - realtime
+      - filesystem
+
+networks:
+  main:
+    driver: bridge
+  javascript-executor-network:
+    driver: bridge
+    internal: true
+
+volumes:
+  db-data:
+  redis-data:
+  filesystem-data:
